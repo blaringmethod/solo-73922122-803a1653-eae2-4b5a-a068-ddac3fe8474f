@@ -16,13 +16,14 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from psycopg.rows import dict_row
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-from . import backup, config, db, lsn, recovery, state
+from . import backup, config, db, ingest, lsn, recovery, state
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -56,6 +57,10 @@ async def lifespan(_app):
     os.makedirs(os.path.dirname(config.STATE_DB), exist_ok=True)
     state.init()
     recovery.cleanup_on_startup()
+    try:
+        ingest.ensure_schema()
+    except Exception:  # noqa: BLE001 - endpoints retry lazily
+        log.exception("could not create the dual-source ingest schema yet")
     # physical base backup is established at startup, in the background
     threading.Thread(target=backup.run_base_backup, daemon=True, name="base-backup").start()
     threading.Thread(target=_readiness_loop, daemon=True, name="readiness").start()
@@ -64,16 +69,18 @@ async def lifespan(_app):
 
 
 app = FastAPI(
-    title="Traffic PITR Recovery API",
-    version="1.0.0",
+    title="Traffic PITR Recovery + Dual-Source Ingest API",
+    version="1.1.0",
     description=(
-        "Physical point-in-time recovery for the traffic_minute_counts table. "
-        "Flow: 1) POST /demo/generate to simulate collection, "
-        "2) POST /restore-points to create a named restore point, "
-        "3) POST /demo/delete to simulate the accidental deletion, "
-        "4) POST /recoveries to rebuild an isolated read-only replica at the "
-        "restore point, 5) GET /replica/traffic to fetch the lost rows. "
-        "The primary keeps collecting the whole time."
+        "Two capabilities over the traffic minute counts. "
+        "(A) Dual-source hourly ingest: gateways report per intersection, "
+        "source and UTC hour; the first source to decide all 60 minutes is "
+        "published, the primary takes the hour over once complete, and "
+        "primary-missing minutes drop the backup readings. "
+        "(B) Physical point-in-time recovery for the traffic_minute_counts "
+        "table: POST /demo/generate, POST /restore-points, POST /demo/delete, "
+        "POST /recoveries, GET /replica/traffic. "
+        "Demo entry point: /docs."
     ),
     lifespan=lifespan,
 )
@@ -241,6 +248,110 @@ def replica_traffic(
 
 
 # --------------------------------------------------------------------------
+# dual-source hourly ingest
+# --------------------------------------------------------------------------
+
+class MinuteReport(BaseModel):
+    """One minute's conclusion from a gateway: a count or an explicit gap."""
+
+    minute_utc: datetime
+    vehicle_count: int | None = Field(default=None, ge=0)
+    missing: bool = False
+
+    @model_validator(mode="after")
+    def _one_conclusion(self):
+        if self.missing:
+            if self.vehicle_count is not None:
+                raise ValueError("a missing minute cannot carry a vehicle_count")
+        elif self.vehicle_count is None:
+            raise ValueError(
+                "each minute needs vehicle_count >= 0, or missing=true"
+            )
+        return self
+
+
+class IngestReport(BaseModel):
+    """A batch of minute conclusions for one intersection, source and hour."""
+
+    intersection_id: str = Field(..., min_length=1, max_length=128)
+    source: str = Field(..., pattern=r"^(primary|backup)$")
+    hour_utc: datetime
+    minutes: list[MinuteReport] = Field(..., min_length=1, max_length=60)
+
+
+def _conflict(exc: ingest.Conflict) -> HTTPException:
+    return HTTPException(409, {"message": str(exc), **exc.detail})
+
+
+@app.post(
+    "/ingest/reports",
+    tags=["dual-source ingest"],
+    responses={409: {"description": "batch rejected or a concurrent report holds the hour"}},
+)
+def ingest_report(report: IngestReport):
+    """Report minute conclusions for one intersection/source/UTC hour.
+
+    Idempotent for an identical retransmission; a batch that disagrees with
+    already recorded minutes for that source is rejected as a whole (409).
+    The first source to decide all 60 minutes is published; once the primary
+    has done so the hour is served from the primary, whose missing minutes
+    drop the backup readings. Progress, serving source and
+    ``traffic_minute_counts`` commit in one transaction.
+    """
+    try:
+        return ingest.report(
+            report.intersection_id,
+            report.source,
+            report.hour_utc,
+            [
+                {
+                    "minute": item.minute_utc,
+                    "is_missing": item.missing,
+                    "vehicle_count": item.vehicle_count,
+                }
+                for item in report.minutes
+            ],
+        )
+    except ingest.BadRequest as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ingest.Conflict as exc:
+        raise _conflict(exc) from exc
+
+
+@app.get("/ingest/hours", tags=["dual-source ingest"])
+def ingest_hour(
+    intersection_id: str = Query(..., min_length=1, max_length=128),
+    hour_utc: datetime = Query(..., description="whole UTC hour, e.g. 2026-11-20T08:00:00Z"),
+):
+    """Query one intersection/hour: serving source plus that version's detail.
+
+    Returns 409 (with per-source progress) while neither gateway has reported
+    the full hour. The serving source, version and rows come from a single
+    repeatable-read snapshot, so they always belong to the same publication.
+    """
+    try:
+        return ingest.get_hour(intersection_id, hour_utc)
+    except ingest.BadRequest as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ingest.NotReady as exc:
+        raise HTTPException(
+            409, {"message": str(exc), "not_ready": True, **exc.detail}
+        ) from exc
+
+
+@app.get("/ingest/progress", tags=["dual-source ingest"])
+def ingest_progress(
+    intersection_id: str = Query(..., min_length=1, max_length=128),
+    hour_utc: datetime = Query(..., description="whole UTC hour, e.g. 2026-11-20T08:00:00Z"),
+):
+    """Per-source upload progress for one intersection/hour (no readiness gate)."""
+    try:
+        return ingest.get_progress(intersection_id, hour_utc)
+    except ingest.BadRequest as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+# --------------------------------------------------------------------------
 # demo: simulated collection + accidental deletion on the primary
 # --------------------------------------------------------------------------
 
@@ -330,3 +441,78 @@ def demo_overview():
         "recoveries": state.q("SELECT * FROM recoveries ORDER BY id DESC"),
         "current_recovery_id": state.kv_get("current_recovery_id"),
     }
+
+
+@app.post("/demo/dual-source/generate", tags=["demo"])
+def demo_dual_source_generate(
+    intersection_id: str = Query("IX-DEMO", min_length=1, max_length=128),
+    source: str = Query(..., pattern=r"^(primary|backup)$"),
+    hour_utc: datetime = Query(..., description="whole UTC hour, e.g. 2026-11-20T08:00:00Z"),
+    start_minute: int = Query(0, ge=0, le=59),
+    end_minute: int = Query(59, ge=0, le=59),
+    missing_start: int | None = Query(None, ge=0, le=59),
+    missing_end: int | None = Query(None, ge=0, le=59),
+    base_count: int = Query(20, ge=0),
+):
+    """Feed one gateway's conclusions through the real ingest path.
+
+    Generates an inclusive minute range for one source and posts it via the
+    same logic as ``POST /ingest/reports``. Counts are deterministic
+    (``base_count + offset`` for the primary, ``base_count + 100 + offset``
+    for the backup) so the same call twice is a true retransmission and the
+    source switch is visible in the returned rows. ``missing_start``..
+    ``missing_end`` marks that inclusive range as explicitly unreported.
+    """
+    if start_minute > end_minute:
+        raise HTTPException(400, "start_minute must not be greater than end_minute")
+    if (missing_start is None) != (missing_end is None):
+        raise HTTPException(
+            400, "missing_start and missing_end must be given together"
+        )
+    if (
+        missing_start is not None
+        and missing_end is not None
+        and missing_start > missing_end
+    ):
+        raise HTTPException(400, "missing_start must not be greater than missing_end")
+
+    minutes = []
+    for offset in range(start_minute, end_minute + 1):
+        minute = hour_utc + timedelta(minutes=offset)
+        is_missing = (
+            missing_start is not None
+            and missing_end is not None
+            and missing_start <= offset <= missing_end
+        )
+        count = None if is_missing else base_count + (0 if source == "primary" else 100) + offset
+        minutes.append(
+            {"minute": minute, "is_missing": is_missing, "vehicle_count": count}
+        )
+    try:
+        result = ingest.report(intersection_id, source, hour_utc, minutes)
+    except ingest.BadRequest as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ingest.Conflict as exc:
+        raise _conflict(exc) from exc
+    return {"submitted_minutes": len(minutes), **result}
+
+
+@app.post("/demo/reset", tags=["demo"])
+def demo_reset(confirm: bool = Query(False)):
+    """Demo only: empty the business table and dual-source bookkeeping.
+
+    The PITR demo asserts absolute row counts, so run this (or a fresh stack)
+    before mixing the two demos. Requires ``confirm=true``; refuses while a
+    recovery is in flight. Restore points/recovery bookkeeping is untouched.
+    """
+    if not confirm:
+        raise HTTPException(400, "pass confirm=true to wipe business and ingest data")
+    if state.one("SELECT id FROM recoveries WHERE status='running'"):
+        raise HTTPException(409, "a recovery is in flight; reset refused")
+    ingest.ensure_schema()
+    with db.primary_tx() as conn:
+        conn.execute(f"DELETE FROM {config.TRAFFIC_TABLE}")
+        conn.execute("DELETE FROM gateway_ingest.minute_conclusion")
+        conn.execute("DELETE FROM gateway_ingest.source_progress")
+        conn.execute("DELETE FROM gateway_ingest.hour_state")
+    return {"reset": True}

@@ -6,6 +6,7 @@ set -euo pipefail
 
 BASE="${BASE:-http://localhost:8000}"
 POINT="${POINT:-before_delete}"
+RESET="${RESET:-1}"
 
 say()  { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 fail() { printf '\033[31mFAIL: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -21,6 +22,11 @@ for _ in $(seq 1 90); do
 done
 [ "$status" = "ready" ] || fail "base backup never became ready (last: ${status:-unknown})"
 curl -fsS "$BASE/backup" | jq .
+
+if [ "$RESET" = "1" ]; then
+  say "0b. reset business + dual-source data so the absolute row counts hold"
+  curl -fsS -X POST "$BASE/demo/reset?confirm=true" | jq .
+fi
 
 say "1. simulate collection: 3 intersections x 20 minutes on the primary"
 curl -fsS -X POST "$BASE/demo/generate?intersections=3&minutes=20&prefix=IX" | jq .

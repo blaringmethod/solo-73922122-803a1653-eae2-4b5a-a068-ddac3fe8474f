@@ -40,14 +40,67 @@ docker compose up --build
 # 等待 api 就绪后:
 # 1) 打开演示入口 http://localhost:8000/docs （Swagger UI，根路径 / 会重定向到这里）
 # 2) 或跑一键演示脚本（需要 curl 和 jq）:
-./scripts/demo.sh
+./scripts/demo.sh                  # PITR 恢复
+./scripts/demo-dual-source.sh      # 双源按小时供数
 ```
 
 演示脚本完整走一遍：模拟采集写入 → 创建恢复点 `before_delete` → 等待 WAL 归档齐全 →
 模拟误删最近 10 分钟 → 主库继续写入新路口数据 → 发起 PITR 恢复 → 从只读副本查回被删
 记录 → 断言副本不含恢复点之后的提交、主库数据未受影响。
 
-## API 一览（详见 /docs）
+两个脚本默认先调 `POST /demo/reset?confirm=true` 清空业务表与采集台账，因为 PITR 脚本
+断言的是绝对行数；如要保留数据，设 `RESET=0`。
+
+## 双源按小时供数（新增）
+
+新接入路口同时用**主网关**和**备用网关**采集车流。分析员按小时取数，每小时只采用
+一个来源。本服务新增下面这组接口（与 PITR 接口共用 `/docs`）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/ingest/reports` | 按 路口 + 来源(primary/backup) + UTC 整点小时 批量上报分钟结论 |
+| GET | `/ingest/hours` | 按路口和小时查询：供数来源 + 该版本的明细；两源都未齐返回 409 |
+| GET | `/ingest/progress` | 只看两源上报进度（不要求已就绪） |
+| POST | `/demo/dual-source/generate` | 演示用：按分钟范围/缺报区间构造一批上报，走同一套逻辑 |
+| POST | `/demo/reset?confirm=true` | 演示用：清空业务表与双源台账（恢复任务在途时拒绝） |
+
+上报体：
+
+```json
+{
+  "intersection_id": "IX-1",
+  "source": "primary",
+  "hour_utc": "2026-11-20T08:00:00Z",
+  "minutes": [
+    {"minute_utc": "2026-11-20T08:00:00Z", "vehicle_count": 42},
+    {"minute_utc": "2026-11-20T08:01:00Z", "missing": true}
+  ]
+}
+```
+
+每条分钟结论要么是非负 `vehicle_count`，要么 `missing: true`（二者互斥，模型校验）。
+
+### 语义（对照需求）
+
+- **按路口/来源/整点小时分批**：`hour_utc` 必须是 UTC 整点，`minute_utc` 必须对齐到
+  分钟且落在该小时内；一批最多 60 条。
+- **先报齐者先供数**：某来源把 60 个分钟全部给出结论（计数或明确缺报）即“报齐”；
+  备用网关先报齐就先用备用供数。
+- **主源报齐后整小时换主源**：主网关报齐后该小时整体切换到主源。
+- **主源缺报的分钟撤下备用读数**：切换/发布时整小时按供数来源重建——
+  该来源标记缺报的分钟直接没有行，绝不留另一来源的读数。
+- **同源同分钟幂等/整批拒绝**：相同内容重传不改变任何结果（版本不变）；任何一条
+  与已记录结论不一致则整批 409，**同批里合法的新分钟也不落库**。
+- **并发不倒退**：同一 `(路口, 小时)` 的写在事务级 advisory lock 下串行（提交即释放），
+  已发布的主源不会被较慢的备用上报改回；数据库触发器 `hour_state_no_downgrade`
+  在存储层再兜底一次 primary→backup 的倒退。
+- **进度/来源/业务表同事务**：`gateway_ingest.*` 台账与 `traffic_minute_counts` 在
+  **同一个 Postgres 库、同一个事务**里提交（这是台账放在源库而不是 SQLite 的原因），
+  所以不存在“进度记了但业务行没写”或反之；API 重启后按已提交状态续报。
+- **查询同一版**：`GET /ingest/hours` 在 REPEATABLE READ 快照里读供数来源、版本和明细，
+  不会出现“来源是备用、明细却已是主源”的混版；两源都未报齐返回 409 且带进度。
+
+## 恢复语义（对照需求）
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -88,7 +141,7 @@ docker compose up --build
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE` | db/5432/postgres/postgres/traffic | 主库连接 |
+| `PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE` | db/5432/postgres/postgres/traffic | 主库连接（双源台账也在这个库的 `gateway_ingest` schema） |
 | `REPLICA_PORT` | 55433 | 副本监听端口（容器内 127.0.0.1） |
 | `RECOVERY_TIMEOUT_SEC` | 180 | 等待重放到目标点的超时 |
 | `REPLICA_RUN_AS` | postgres | 副本进程运行用户（容器内 root 经 gosu 降权；本地裸跑可置空） |
@@ -122,7 +175,31 @@ PMSIGNAL）。这两点在正常 Linux / Docker 中不存在，属沙箱特有�
 - ✅ API 重启清理：遗留 running/success 任务置 failed、目录删除、指针清空
 - ✅ LSN/WAL 段名计算单元测试、compose YAML、demo.sh 语法、OpenAPI 生成
 
-未能在本环境验证（沙箱信号限制所致，逻辑已在 docker 场景设计并走查）：
+双源按小时供数（本轮新增，已真实运行验证）：
+
+- ✅ `pytest api/tests/test_ingest.py`：**16 项全过**（真实 PostgreSQL 16.2）
+  - 未报齐 → `/ingest/hours` 409 并带两源进度
+  - 备用先报齐即由备用供数；主源报齐后整小时切主源，主源缺报分钟撤下备用读数
+  - 主源已发布后，备用首次上报/迟到补报都**不会**退回备用
+  - 同源同分钟同内容重传：`new_minutes=0`、`changed=false`、版本不变
+  - 异内容整批 409，且同批合法的新分钟也**未落库**（事务整体回滚）
+  - 同分钟不同来源互不干扰；批内重复分钟、越界分钟、非整点小时、无时区时间、
+    负数/缺失计数或标记矛盾均按 400/422 拒绝
+  - 同小时锁：持锁期间上报等待，释放后继续；超过等待上限返回 409 且未写入
+  - 4 线程并发上报（两源交错分片 + 重复提交）：最终必为主源、60 行
+  - 新进程（模拟重启）从已提交状态续报并完成发布
+  - 数据库触发器阻止 `primary → backup` 的倒退 UPDATE
+  - 事务中途失败（模拟崩溃）后结论/进度/业务行全部回滚，重试能正常发布
+- ✅ 真实 uvicorn 进程 + `scripts/demo-dual-source.sh` 全流程通过（补传、切换、幂等、
+  拒收、不倒退、未就绪 409）
+- ✅ 并发压测：8 路并行上报 200 全成功；主/备整小时同时上送 5 轮，最终都为主源
+- ✅ `/ingest/hours` 在 REPEATABLE READ 快照内读取：读取期间切换提交，返回的来源
+  与明细仍属同一版本（已用注入切换的方式验证）
+- ✅ `db/init/01-init.sql` 在空库上建表 + 建触发器成功，重复执行幂等
+- ✅ OpenAPI 生成、`/docs` 200、`/demo/reset` 需 `confirm=true`
+- ✅ 6 个进程同时冷启动建 schema（并发 DDL 竞争）全部成功
+
+未能在本环境验证（沙箱限制所致）：
 
 - ⚠️ `docker compose up` 整体构建与联调（沙箱无 docker）
 - ⚠️ `pg_basebackup` 成功路径（沙箱禁止 checkpoint 信号；失败路径已验证）
@@ -132,9 +209,22 @@ PMSIGNAL）。这两点在正常 Linux / Docker 中不存在，属沙箱特有�
   数据正确性已用单用户模式验证（见上）
 - ⚠️ `pg_ctl stop` 退役旧副本（沙箱无法发信号；docker 中正常）
 
+**关于本沙箱的一个新发现**：除信号限制外，本沙箱里任何被阻塞在锁上的 backend
+即使等锁方释放也**不会被唤醒**（用纯 psycopg 复现：行锁、advisory 锁、
+`lock_timeout` 均不触发）。因此双源并发串行化没有采用会无限期阻塞的
+`pg_advisory_xact_lock` / `SELECT … FOR UPDATE`，改为 `pg_try_advisory_xact_lock`
+有界轮询（`LOCK_WAIT_SEC`，默认 20s），保证在受限环境同样可用；正常环境两种写法
+语义一致（同一 `(路口,小时)` 同一时刻仅一个写入者，持锁到提交）。
+
 ## 限制
 
 - 单 api 进程、单副本端口：同一时刻一个恢复、一个副本（需求即如此）。
 - 基准备份为启动时一份；api 重启会重取备份，此前创建的恢复点会标记 `expired`。
 - 恢复点名称唯一（重复创建返回 409）；WAL 归档卷只增不减，演示规模无清理策略。
 - 无认证鉴权，仅限内网演示。
+- 双源：一个路口的某个小时一旦由主源发布就不会回退（即使主源之后数据有变，也只能
+  追加分钟，不能改已确认分钟——结论按设计不可变）。上报是“全量批次”语义：一批里
+  不含的分钟视为“还没报”，不会被当作缺报。
+- 双源台账放在源库 `gateway_ingest` schema（PITR 库多了一个 schema，业务表仍只有
+  `traffic_minute_counts` 一张）；恢复副本是源库的物理拷贝，因此镜像里也带这份台账，
+  `/replica/traffic` 仍只查业务表。
